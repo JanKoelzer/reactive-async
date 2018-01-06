@@ -4,15 +4,15 @@ import java.util.concurrent.ForkJoinPool
 import java.util.concurrent.atomic.AtomicReference
 
 import scala.annotation.tailrec
+import scala.util.control.NonFatal
 import scala.concurrent.Await
 import scala.concurrent.duration._
 
-import scala.concurrent.{Future, Promise}
+import scala.concurrent.{ Future, Promise }
 
 import lattice.Key
 
 import org.opalj.graphs._
-
 
 /* Need to have reference equality for CAS.
  */
@@ -21,7 +21,7 @@ class PoolState(val handlers: List[() => Unit] = List(), val submittedTasks: Int
     submittedTasks == 0
 }
 
-class HandlerPool(parallelism: Int = 8) {
+class HandlerPool(parallelism: Int = 8, unhandledExceptionHandler: Throwable => Unit = _.printStackTrace()) {
 
   private val pool: ForkJoinPool = new ForkJoinPool(parallelism)
 
@@ -66,17 +66,17 @@ class HandlerPool(parallelism: Int = 8) {
     p.future
   }
 
-  def whileQuiescentResolveCell[K <: Key[V], V]: Unit = {
+  def whileQuiescentResolveCell[K <: Key[V], V](atMost: Duration = Duration.Inf): Unit = {
     while (!cellsNotDone.get().isEmpty) {
       val fut = this.quiescentResolveCell
-      Await.ready(fut, 15.minutes)
+      Await.ready(fut, atMost)
     }
   }
 
-  def whileQuiescentResolveDefault[K <: Key[V], V]: Unit = {
+  def whileQuiescentResolveDefault[K <: Key[V], V](atMost: Duration = Duration.Inf): Unit = {
     while (!cellsNotDone.get().isEmpty) {
       val fut = this.quiescentResolveDefaults
-      Await.ready(fut, 15.minutes)
+      Await.ready(fut, atMost)
     }
   }
 
@@ -127,22 +127,24 @@ class HandlerPool(parallelism: Int = 8) {
     p.future
   }
 
-  /** Resolves a cycle of unfinished cells.
+  /**
+   * Resolves a cycle of unfinished cells.
    */
   private def resolveCycle[K <: Key[V], V](cells: Seq[Cell[K, V]]): Unit = {
     val key = cells.head.key
     val result = key.resolve(cells)
 
-    for((c, v) <- result) c.resolveWithValue(v)
+    for ((c, v) <- result) c.resolveWithValue(v)
   }
 
-  /** Resolves a cell with default value.
+  /**
+   * Resolves a cell with default value.
    */
   private def resolveDefault[K <: Key[V], V](cells: Seq[Cell[K, V]]): Unit = {
     val key = cells.head.key
     val result = key.fallback(cells)
 
-    for((c, v) <- result) c.resolveWithValue(v)
+    for ((c, v) <- result) c.resolveWithValue(v)
   }
 
   // Shouldn't we use:
@@ -164,29 +166,34 @@ class HandlerPool(parallelism: Int = 8) {
     // Run the task
     pool.execute(new Runnable {
       def run(): Unit = {
-        task.run()
-
-        var success = false
-        var handlersToRun: Option[List[() => Unit]] = None
-        while (!success) {
-          val state = poolState.get()
-          if (state.submittedTasks > 1) {
-            handlersToRun = None
-            val newState = new PoolState(state.handlers, state.submittedTasks - 1)
-            success = poolState.compareAndSet(state, newState)
-          } else if (state.submittedTasks == 1) {
-            handlersToRun = Some(state.handlers)
-            val newState = new PoolState()
-            success = poolState.compareAndSet(state, newState)
-          } else {
-            throw new Exception("BOOM")
+        try {
+          task.run()
+        } catch {
+          case NonFatal(e) =>
+            unhandledExceptionHandler(e)
+        } finally {
+          var success = false
+          var handlersToRun: Option[List[() => Unit]] = None
+          while (!success) {
+            val state = poolState.get()
+            if (state.submittedTasks > 1) {
+              handlersToRun = None
+              val newState = new PoolState(state.handlers, state.submittedTasks - 1)
+              success = poolState.compareAndSet(state, newState)
+            } else if (state.submittedTasks == 1) {
+              handlersToRun = Some(state.handlers)
+              val newState = new PoolState()
+              success = poolState.compareAndSet(state, newState)
+            } else {
+              throw new Exception("BOOM")
+            }
           }
-        }
-        if (handlersToRun.nonEmpty) {
-          handlersToRun.get.foreach { handler =>
-            execute(new Runnable {
-              def run(): Unit = handler()
-            })
+          if (handlersToRun.nonEmpty) {
+            handlersToRun.get.foreach { handler =>
+              execute(new Runnable {
+                def run(): Unit = handler()
+              })
+            }
           }
         }
       }
